@@ -1,0 +1,68 @@
+name: Docker
+
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: "Docker image name and tag"
+        required: false
+        default: "ret2shell:latest"
+
+jobs:
+  # Build and export the docker image
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    env:
+      # These environment variables will be set by `setup-env.sh`
+      app_v: unknown
+      commit_sha: unknown
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # fetch depth 0 to fetch all history for git-restore-mtime-action
+          fetch-depth: 0
+
+      - uses: chetan/git-restore-mtime-action@v2
+
+      # Before this step, we can't use env variables declared in `env` of this job
+      - name: Setup environment
+        id: setup-env
+        run: bash .github/setup-env.sh
+
+      - name: Build on version ${{ env.app_v }}-${{ env.commit_sha }}
+        id: build
+        run: |
+          image="$(echo ${{ inputs.image }} | tr -d '[:space:]')"
+          if [ -z "$image" ]; then
+            image='ret2shell:${{ env.app_v }}'
+          fi
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+
+          echo "Building: $image"
+          docker build \
+            --build-arg "R2S_GIT_VERSION=${{ env.commit_sha }}" \
+            --load \
+            -t "$image" \
+            -f Containerfile .
+
+      - name: Export image
+        id: export
+        run: |
+          image='${{ steps.build.outputs.image }}'
+          output_fn="$(echo "$image" | tr ':' '_')"
+          echo "output_fn=$output_fn" >> "$GITHUB_OUTPUT"
+          docker save "$image" -o '${{ runner.temp }}/image.tar'
+          sha256sum '${{ runner.temp }}/image.tar' > '${{ runner.temp }}/image.tar.sha256'
+
+      - name: Upload artifact
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.export.outputs.output_fn }}
+          path: |
+            ${{ runner.temp }}/image.tar
+            ${{ runner.temp }}/image.tar.sha256
+          compression-level: 9
+          retention-days: 1

@@ -1,0 +1,28 @@
+
+.DS_Store/
+node_modules/
+build/
+/package/
+debug/
+*.bak
+
+# Rust / Cargo
+**/*.rs.bk
+Cargo.dup
+target/
+
+# Web build
+dist/
+
+data/*
+!data/.gitkeep
+
+# environment file
+.env.*
+!.env.example
+
+# configuration files
+/config/config.toml
+
+ret2shell.tar.gz
+kubeconfig.yaml

@@ -1,0 +1,35 @@
+# To get started with Dependabot version updates, you'll need to specify which
+# package ecosystems to update and where the package manifests are located.
+# Please see the documentation for all configuration options:
+# https://docs.github.com/github/administering-a-repository/configuration-options-for-dependency-updates
+
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    groups:
+      # dependencies in Cargo.toml as one pull request
+      cargo-dependencies:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: "npm"
+    directory: "/web/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    groups:
+      # dependencies in package.json as one pull request
+      npm-dependencies:
+        dependency-type: "production"
+        update-types: ["minor", "patch"]
+      # devDependencies in package.json as one pull request
+      npm-devDependencies:
+        dependency-type: "development"
+        update-types: ["minor", "patch"]
+    ignore:
+      # ignore any patch versions for node types
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-patch"]

@@ -1,0 +1,789 @@
+use std::collections::HashSet;
+
+use chrono::Utc;
+use futures::StreamExt;
+use r2s_bucket::Bucket;
+use r2s_cache::Cache;
+use r2s_checker::Checker;
+use r2s_database::{
+  DbErr, audit, challenge, challenge_milestone, extra, game, submission,
+  team::{self, TeamScoreHistory, TeamScoreHistoryList},
+  user,
+};
+use r2s_engine::Engine;
+use r2s_event::{
+  Event,
+  events::{EventContainer, SubmissionEvent, SubmissionEventType},
+};
+use r2s_migrator::Database;
+use r2s_queue::{Queue, TracedMessage};
+use sea_orm::TransactionTrait;
+use serde::{Deserialize, Serialize};
+use tracing::{Instrument, Span, debug, error, error_span, info, warn};
+
+use crate::{
+  traits::{GlobalState, ResponseError},
+  utility::game_repo::schedule_next_missing_game_repo_index_refresh,
+};
+
+const GAME_REPO_INDEX_REFRESH_INTERVAL_SECS: u64 = 30;
+
+/// Topic carrying score maintenance work for the scoreboard worker.
+pub const SCOREBOARD_TOPIC: &str = "scoreboard";
+
+/// Scope of a game-wide score maintenance request.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GameMaintenanceScope {
+  /// Rescore every team of the game, e.g. after milestone edits or imports.
+  #[default]
+  All,
+  /// Refresh blood rewards and rescore only the teams they belong to.
+  BloodRates,
+}
+
+/// Maintenance payload of [`SCOREBOARD_TOPIC`]. A challenge payload rescores
+/// the teams that solved it (e.g. after score decay); a game payload rescores
+/// the whole game by default, or only the teams affected by blood rewards when
+/// its scope is [`GameMaintenanceScope::BloodRates`]. Untagged on purpose: the
+/// challenge arm keeps the historical bare-model shape, and a missing `scope`
+/// keeps the historical full-game rescore, so pending messages published by an
+/// older binary still deserialize after a hot upgrade.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ScoreMaintenance {
+  Challenge(Box<challenge::Model>),
+  Game {
+    game_id: i64,
+    #[serde(default)]
+    scope: GameMaintenanceScope,
+  },
+}
+
+impl ScoreMaintenance {
+  /// Rescore every team of the game.
+  pub fn game(game_id: i64) -> Self {
+    Self::Game {
+      game_id,
+      scope: GameMaintenanceScope::All,
+    }
+  }
+
+  /// Refresh blood rewards and rescore only the teams they belong to.
+  pub fn blood_rates(game_id: i64) -> Self {
+    Self::Game {
+      game_id,
+      scope: GameMaintenanceScope::BloodRates,
+    }
+  }
+}
+
+pub async fn spawn_game_workers(state: GlobalState) {
+  let queue = state.queue.clone();
+  let database = state.db.clone();
+  let checker = state.checker.clone();
+  let bucket = state.bucket.clone();
+  let cache = state.cache.clone();
+  let engine = state.engine.clone();
+  tokio::spawn(submission_worker(
+    queue.clone(),
+    database.clone(),
+    cache,
+    engine,
+    checker,
+    bucket,
+  ));
+  tokio::spawn(score_maintenance_worker(queue, database));
+  tokio::spawn(game_repo_index_worker(state));
+}
+
+async fn game_repo_index_worker(state: GlobalState) {
+  info!(
+    interval_secs = GAME_REPO_INDEX_REFRESH_INTERVAL_SECS,
+    "game repo index worker started"
+  );
+  let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
+    GAME_REPO_INDEX_REFRESH_INTERVAL_SECS,
+  ));
+  loop {
+    ticker.tick().await;
+    schedule_next_missing_game_repo_index_refresh(&state).await;
+  }
+}
+
+async fn score_maintenance_worker(queue: Queue, db: Database) {
+  info!("score maintenance worker started");
+  let messages = queue
+    .subscribe("scoreboard")
+    .await
+    .inspect_err(|err| {
+      error!(error=?err, "failed to subscribe to submission-check queue");
+    })
+    .ok();
+  let mut messages = if let Some(messages) = messages {
+    messages
+  } else {
+    return;
+  };
+  while let Some(message) = messages.next().await {
+    if let Ok(message) = message {
+      let req = String::from_utf8(message.message.payload.to_vec())
+        .inspect_err(|e| {
+          error!(error=?e, "failed to parse message from nats");
+        })
+        .ok();
+      if req.is_none() {
+        message.double_ack().await.ok();
+        continue;
+      }
+      let maintenance = serde_json::from_str::<TracedMessage<ScoreMaintenance>>(&req.unwrap())
+        .inspect_err(|e| {
+          error!(error=?e, "failed to parse message from nats");
+        })
+        .ok();
+      let span = error_span!(
+        "request",
+        trace=%maintenance.as_ref().map(|m| &m.trace).unwrap_or(&"UNKNOWN".to_owned())
+      );
+      let created_at = maintenance.as_ref().map(|m| m.created_at);
+      if created_at
+        .is_none_or(|c| Utc::now().signed_duration_since(c) > chrono::Duration::minutes(10))
+      {
+        debug!("score maintenance message expired, dropping");
+        message.double_ack().await.ok();
+        continue;
+      }
+      match maintenance.map(|m| m.payload) {
+        None => {
+          message.double_ack().await.ok();
+        }
+        Some(ScoreMaintenance::Challenge(challenge)) => {
+          // reload the challenge so the rescore sees the current score
+          let Some(Some(challenge)) = challenge::get(&db.conn, challenge.id)
+            .await
+            .inspect_err(|e| error!(error=?e, "failed to load challenge for scoreboard worker"))
+            .ok()
+          else {
+            message.double_ack().await.ok();
+            continue;
+          };
+          score_maintenance_worker_exec(db.clone(), challenge)
+            .instrument(span)
+            .await
+            .inspect_err(|e| error!(error=?e, "failed to process message"))
+            .ok();
+          message.double_ack().await.ok();
+        }
+        Some(ScoreMaintenance::Game { game_id, scope }) => {
+          match scope {
+            GameMaintenanceScope::All => {
+              score_maintenance_worker_exec_game(db.clone(), game_id)
+                .instrument(span)
+                .await
+                .inspect_err(|e| error!(error=?e, "failed to process message"))
+                .ok();
+            }
+            GameMaintenanceScope::BloodRates => {
+              score_maintenance_worker_exec_blood_rates(db.clone(), game_id)
+                .instrument(span)
+                .await
+                .inspect_err(|e| error!(error=?e, "failed to process message"))
+                .ok();
+            }
+          }
+          message.double_ack().await.ok();
+        }
+      }
+    }
+  }
+}
+
+async fn score_maintenance_worker_exec(
+  db: Database, challenge: challenge::Model,
+) -> Result<(), ResponseError> {
+  let game = game::get(&db.conn, challenge.game_id)
+    .await?
+    .ok_or_else(|| DbErr::Custom(format!("game {} not found", challenge.game_id)))?;
+  // Every team that solved the challenge is rescaled below, so the affected
+  // team set returned by the sync is not needed here.
+  sync_blood_bonus(&db, &game, &challenge).await?;
+
+  let txn = db.conn.begin().await?;
+  let submissions = submission::get_list(
+    &txn,
+    true,
+    false,
+    Some(challenge.game_id),
+    Some(challenge.id),
+    None,
+    None,
+    false,
+  )
+  .await?;
+  for submission in submissions {
+    let team_id = submission.team_id.unwrap();
+    let team = team::get(&txn, team_id).await?;
+    let team = if let Some(team) = team {
+      team
+    } else {
+      continue;
+    };
+    let score = team::calc_score(&txn, team.id).await?;
+    let mut history = team.history.0.clone();
+    let changed_at = Utc::now();
+    if history.last().map(|h| h.changed_at.timestamp()) != Some(changed_at.timestamp()) {
+      history.push(TeamScoreHistory {
+        changed_at,
+        blood_state: None,
+        challenge_id: None,
+        score,
+      });
+    }
+    team::update(
+      &txn,
+      team::Model {
+        id: team.id,
+        score,
+        history: TeamScoreHistoryList(history),
+        ..team
+      },
+    )
+    .await?;
+  }
+  txn.commit().await?;
+  Ok(())
+}
+
+async fn submission_worker(
+  queue: Queue, db: Database, cache: Cache, engine: Engine, checker: Checker, bucket: Bucket,
+) {
+  let messages = queue
+    .subscribe("check")
+    .await
+    .inspect_err(|err| {
+      error!(error=?err, "failed to subscribe to submission-check queue");
+    })
+    .ok();
+  let mut messages = if let Some(messages) = messages {
+    messages
+  } else {
+    return;
+  };
+
+  // NOTE: we do not use message time to deduplicate here, we should ensure all
+  // the submissions are checked, even if they are redelivered due to worker
+  // crashes.
+  while let Some(message) = messages.next().await {
+    if let Ok(message) = message {
+      let req = String::from_utf8(message.message.payload.to_vec())
+        .inspect_err(|e| {
+          error!(error=?e, "failed to parse message from nats");
+        })
+        .ok();
+      if req.is_none() {
+        message.double_ack().await.ok();
+        continue;
+      }
+      let submission_msg = serde_json::from_str::<TracedMessage<submission::Model>>(&req.unwrap())
+        .inspect_err(|e| {
+          error!(error=?e, "failed to parse message from nats");
+        })
+        .ok();
+      if submission_msg.is_none() {
+        message.double_ack().await.ok();
+        continue;
+      }
+      let submission_msg = submission_msg.unwrap();
+      let trace = submission_msg.trace.to_owned();
+      let Some(Some(submission)) = submission::get(&db.conn, submission_msg.payload.id)
+        .await
+        .inspect_err(|e| error!(error=?e, "failed to load submission from database"))
+        .ok()
+      else {
+        message.double_ack().await.ok();
+        continue;
+      };
+      if submission.result.is_some() || submission.solved.is_some() {
+        debug!(
+          submission_id = submission.id,
+          "submission already processed, skip message"
+        );
+        message.double_ack().await.ok();
+        continue;
+      }
+      let span = error_span!(
+        "request", trace=%trace,
+        "data-submission-id"=%submission.id,
+        "data-submission-content"=?submission.content,
+        "user-id"=tracing::field::Empty,
+        "user-account"=tracing::field::Empty,
+        "user-nickname"=tracing::field::Empty,
+        "team-id"=tracing::field::Empty,
+        "team-name"=tracing::field::Empty,
+        "data-challenge-id"=%submission.challenge_id,
+        "data-challenge-name"=tracing::field::Empty,
+        "data-game-id"=tracing::field::Empty,
+        "data-game-name"=tracing::field::Empty
+      );
+      let result = submission_worker_exec(
+        queue.clone(),
+        db.clone(),
+        cache.clone(),
+        engine.clone(),
+        checker.clone(),
+        bucket.clone(),
+        &submission,
+        &trace,
+      )
+      .instrument(span)
+      .await
+      .inspect_err(|e| error!(error=?e, "failed to process message"))
+      .ok();
+      if result.is_none() {
+        submission::update(
+          &db.conn,
+          submission::Model {
+            id: submission.id,
+            solved: Some(false),
+            result: Some("checker fails on your input, incorrect.".to_owned()),
+            ..submission
+          },
+        )
+        .await
+        .ok();
+        message.double_ack().await.ok();
+        continue;
+      }
+      message.double_ack().await.ok();
+    } else {
+      error!(error=?message, "failed to receive message from nats");
+    }
+  }
+}
+
+fn get_award_rate(game: &game::Model, blood_state: i32) -> i32 {
+  if let Some(award_rates) = game.award_rates.clone() {
+    if blood_state > 0 && (blood_state as usize) <= award_rates.0.len() {
+      return award_rates.0[blood_state as usize - 1];
+    }
+    return 0;
+  } else if blood_state <= 3 && game.award_rate > 0 {
+    return game.award_rate * (4 - blood_state) / 3;
+  }
+  0
+}
+
+fn blood_bonus(challenge_score: i32, award_rate: i32) -> i32 {
+  challenge_score * award_rate / 100
+}
+
+/// Refreshes the blood rewards of a challenge so their score follows the
+/// current challenge score instead of the initial score they were created
+/// with, returning the teams whose reward value changed.
+async fn sync_blood_bonus(
+  db: &Database, game: &game::Model, challenge: &challenge::Model,
+) -> Result<HashSet<i64>, DbErr> {
+  let mut affected_teams = HashSet::new();
+  let txn = db.conn.begin().await?;
+  for reward in extra::get_list(&txn, None, Some(challenge.id), true).await? {
+    let Some(blood_state) = reward.blood_state else {
+      continue;
+    };
+    let score = blood_bonus(challenge.score, get_award_rate(game, blood_state));
+    if score != reward.score {
+      extra::update_score(&txn, reward.id, score).await?;
+      affected_teams.insert(reward.team_id);
+    }
+  }
+  txn.commit().await?;
+  Ok(affected_teams)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn submission_worker_exec(
+  queue: Queue, db: Database, cache: Cache, engine: Engine, checker: Checker, bucket: Bucket,
+  submission: &submission::Model, trace: impl AsRef<str>,
+) -> Result<submission::Model, ResponseError> {
+  // stage 1: get all necessary data
+  let txn = db.conn.begin().await?;
+  let challenge = challenge::get(&txn, submission.challenge_id).await?;
+  let challenge = if let Some(challenge) = challenge {
+    challenge
+  } else {
+    return Err(ResponseError::BadRequest("challenge not found".to_owned()));
+  };
+  Span::current().record("data-challenge-name", challenge.name.as_str());
+  Span::current().record("data-game-id", challenge.game_id);
+  let prev_submitted = submission::count(
+    &txn,
+    true,
+    Some(challenge.game_id),
+    Some(challenge.id),
+    submission.team_id,
+    None,
+    None,
+    false,
+  )
+  .await?
+    > 0;
+
+  let team = if let Some(team_id) = submission.team_id {
+    team::get(&txn, team_id).await?
+  } else {
+    None
+  };
+  let user = user::get(&txn, submission.user_id).await?;
+
+  let game = game::get(&txn, challenge.game_id).await?;
+  let game = if let Some(game) = game {
+    game
+  } else {
+    return Err(ResponseError::BadRequest("game not found".to_owned()));
+  };
+  Span::current().record("data-game-name", game.name.as_str());
+
+  let user = if let Some(user) = user {
+    user
+  } else {
+    return Err(ResponseError::BadRequest("user not found".to_owned()));
+  };
+  Span::current().record("user-id", user.id);
+  Span::current().record("user-account", user.account.as_str());
+  Span::current().record("user-nickname", user.nickname.as_str());
+
+  let challenge_bucket = bucket
+    .at(
+      game
+        .bucket
+        .clone()
+        .ok_or(ResponseError::PreconditionFailed(format!(
+          "game {}:{} does not have a valid bucket",
+          game.id, game.name
+        )))?,
+    )
+    .await?
+    .at(
+      challenge
+        .bucket
+        .clone()
+        .ok_or(ResponseError::PreconditionFailed(format!(
+          "challenge {}:{} in game {}:{} does not have a valid bucket",
+          challenge.id, challenge.name, game.id, game.name
+        )))?,
+    )
+    .await?;
+
+  // stage 2: invoke checker to check the submission
+  checker
+    .preload(&engine, &challenge, &challenge_bucket)
+    .await?;
+  let (solved, result, audit) = checker
+    .check(&engine, &challenge_bucket, &user, &team, submission)
+    .await?;
+  let submission = submission::update(
+    &txn,
+    submission::Model {
+      id: submission.id,
+      solved: Some(solved),
+      result: Some(result),
+      ..submission.clone()
+    },
+  )
+  .await?;
+
+  if solved {
+    info!(correct = true, "submission is correct");
+  } else {
+    info!(correct = false, "submission is incorrect");
+  }
+
+  if team.is_none() || prev_submitted {
+    txn.commit().await?;
+    return Ok(submission);
+  }
+
+  let team = team.unwrap();
+  Span::current().record("team-id", team.id);
+  Span::current().record("team-name", team.name.as_str());
+
+  // stage 3: update team score and create extra or audit if necessary
+  if submission.solved.unwrap_or(false) {
+    info!("updating score and creating events");
+    // stage 3.1: update challenge score
+    let (changed, decay, challenge) = challenge::maintain_score(&txn, challenge.clone()).await?;
+
+    // detect blood state and create extra if necessary
+    let blood_state = if decay <= 3 { Some(decay as i32) } else { None };
+    let changed_at = submission.created_at;
+    let mut team = team.clone();
+    if let Some(blood_state) = blood_state {
+      let score = blood_bonus(challenge.score, get_award_rate(&game, blood_state));
+      if score > 0 {
+        extra::create(
+          &txn,
+          extra::Model {
+            id: 0,
+            created_at: changed_at,
+            team_id: team.id,
+            challenge_id: Some(challenge.id),
+            score,
+            reason: format!(
+              "No.{blood_state} solution for challenge {}:{}",
+              challenge.id, challenge.name
+            ),
+            hint_id: None,
+            blood_state: Some(blood_state),
+          },
+        )
+        .await?;
+      }
+    }
+    // stage 3.2: update team score
+    let score = team::calc_score(&txn, team.id).await?;
+    team.score = score;
+    team.history.0.push(TeamScoreHistory {
+      changed_at,
+      blood_state,
+      challenge_id: Some(challenge.id),
+      score,
+    });
+    team.last_active_at = changed_at;
+    team::update(&txn, team.clone()).await?;
+
+    // stage 3.3: detect the milestones this solve newly achieved, mirroring
+    // the blood detection: the team's solved set now contains this
+    // challenge, so whatever is achieved with it but not without it was
+    // unlocked by this submission
+    let solves =
+      submission::get_list(&txn, true, false, None, None, Some(team.id), None, false).await?;
+    let solved: HashSet<i64> = solves.iter().map(|s| s.challenge_id).collect();
+    let all_milestones = challenge_milestone::get_list(&txn, game.id).await?;
+    let achieved_before: HashSet<i64> = {
+      let mut before = solved.clone();
+      before.remove(&challenge.id);
+      challenge_milestone::achieved_milestones(&before, &all_milestones)
+        .into_iter()
+        .map(|milestone| milestone.id)
+        .collect()
+    };
+    let milestones: Vec<_> = challenge_milestone::achieved_milestones(&solved, &all_milestones)
+      .into_iter()
+      .filter(|milestone| !achieved_before.contains(&milestone.id))
+      .collect();
+    if !milestones.is_empty() {
+      info!(
+        count = milestones.len(),
+        "submission achieved new milestones"
+      );
+    }
+
+    // stage 3.4: create team correct event
+    let event = EventContainer {
+      game_id: challenge.game_id,
+      event: Event::Submission(Box::new(SubmissionEvent {
+        event_type: SubmissionEventType::Correct,
+        submission: submission.clone(),
+        blood_state,
+        milestones,
+        challenge: challenge.clone(),
+        operator: user.clone(),
+        team: Some(team.clone()),
+        peer_team: None,
+        reason: None,
+      })),
+    };
+    txn.commit().await?;
+    queue.publish("event", event, &trace).await.ok(); // publish scoreboard update event if necessary
+    if changed {
+      queue
+        .publish(SCOREBOARD_TOPIC, challenge.clone(), &trace)
+        .await
+        .ok();
+      cache.at("challenge").del(challenge.id).await.ok();
+    }
+  } else {
+    txn.commit().await?;
+  }
+
+  // stage 4: create audit if necessary
+  let txn = db.conn.begin().await?;
+  if let Some(audit) = audit {
+    let peer_team = if audit.peer_team != 0 {
+      let peer_team = team::get(&txn, audit.peer_team).await?;
+      // could not find peer team, this audit is a mistake, ignore it
+      if peer_team.is_none() {
+        txn.commit().await?;
+        return Ok(submission);
+      }
+      peer_team
+    } else {
+      None
+    };
+    let audit = audit::Model {
+      id: 0,
+      created_at: Utc::now(),
+      reason: audit.reason,
+      challenge_id: challenge.id,
+      user_id: user.id,
+      team_id: team.id,
+      game_id: game.id,
+      state: audit::State::Pending,
+    };
+    let audit = audit::create(&txn, audit).await?;
+    warn!(
+      reason=%audit.reason,
+      "cheated submission detected, created audit",
+    );
+    let event = EventContainer {
+      game_id: challenge.game_id,
+      event: Event::Submission(Box::new(SubmissionEvent {
+        event_type: SubmissionEventType::Cheated,
+        submission: submission.clone(),
+        blood_state: None,
+        milestones: Vec::new(),
+        challenge: challenge.clone(),
+        operator: user.clone(),
+        team: Some(team.clone()),
+        peer_team,
+        reason: Some(audit.reason),
+      })),
+    };
+    queue.publish("event", event, &trace).await.ok();
+  }
+
+  txn.commit().await?;
+
+  Ok(submission)
+}
+
+/// Rescores every team of the game: any game-wide score change (milestone
+/// edits, imports, retro fixes, ...) may push any team across an
+/// achievement. Per-team failures are logged and skipped; only listing the
+/// teams can fail.
+async fn score_maintenance_worker_exec_game(db: Database, game_id: i64) -> Result<(), DbErr> {
+  if let Some(game) = game::get(&db.conn, game_id).await? {
+    for challenge in challenge::get_list(&db.conn, game_id, true).await? {
+      // Every team of the game is rescaled below, so the affected team set
+      // returned by the sync is not needed here.
+      sync_blood_bonus(&db, &game, &challenge).await?;
+    }
+  }
+
+  for team in team::get_list_by_game_id(&db.conn, game_id).await? {
+    update_team_state(&db, team).await.ok();
+  }
+  Ok(())
+}
+
+/// Refreshes blood rewards after the game's award rates changed, then rescores
+/// only the teams whose reward value actually changed.
+async fn score_maintenance_worker_exec_blood_rates(
+  db: Database, game_id: i64,
+) -> Result<(), DbErr> {
+  let Some(game) = game::get(&db.conn, game_id).await? else {
+    return Ok(());
+  };
+
+  let mut affected_teams = HashSet::new();
+  for challenge in challenge::get_list(&db.conn, game_id, true).await? {
+    affected_teams.extend(sync_blood_bonus(&db, &game, &challenge).await?);
+  }
+
+  debug!(
+    teams = affected_teams.len(),
+    "rescoring teams after blood rate change"
+  );
+  for team_id in affected_teams {
+    let Some(team) = team::get(&db.conn, team_id).await? else {
+      continue;
+    };
+    update_team_state(&db, team).await.ok();
+  }
+  Ok(())
+}
+
+pub async fn update_team_state(db: &Database, team: team::Model) -> Result<(), ResponseError> {
+  let txn = db.conn.begin().await?;
+  let score = team::calc_score(&txn, team.id).await;
+  if let Err(err) = score {
+    warn!(error=?err, "calc team score failed");
+    return Err(ResponseError::DatabaseError(err));
+  }
+  let score = score.unwrap();
+  if score != team.score {
+    let mut team_history = team.history.clone().0;
+    team_history.push(team::TeamScoreHistory {
+      score,
+      challenge_id: None,
+      changed_at: Utc::now(),
+      blood_state: None,
+    });
+    let result = team::update(
+      &txn,
+      team::Model {
+        id: team.id,
+        score,
+        history: team::TeamScoreHistoryList(team_history),
+        ..team
+      },
+    )
+    .await;
+    if let Err(e) = result {
+      warn!(error=?e, "update team score failed");
+    }
+  }
+  txn.commit().await?;
+  Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::{GameMaintenanceScope, ScoreMaintenance, blood_bonus};
+
+  #[test]
+  fn legacy_game_maintenance_keeps_full_rescore() {
+    let message: ScoreMaintenance = serde_json::from_str(r#"{"game_id":7}"#).unwrap();
+    assert!(matches!(
+      message,
+      ScoreMaintenance::Game {
+        game_id: 7,
+        scope: GameMaintenanceScope::All,
+      }
+    ));
+  }
+
+  #[test]
+  fn blood_rate_maintenance_round_trips() {
+    let message = ScoreMaintenance::blood_rates(7);
+    let encoded = serde_json::to_string(&message).unwrap();
+    assert!(encoded.contains("blood_rates"));
+    let decoded: ScoreMaintenance = serde_json::from_str(&encoded).unwrap();
+    assert!(matches!(
+      decoded,
+      ScoreMaintenance::Game {
+        game_id: 7,
+        scope: GameMaintenanceScope::BloodRates,
+      }
+    ));
+  }
+
+  #[test]
+  fn blood_bonus_follows_the_challenge_score() {
+    assert_eq!(blood_bonus(1000, 5), 50);
+    assert_eq!(blood_bonus(500, 5), 25);
+    assert_eq!(blood_bonus(100, 100), 100);
+  }
+
+  #[test]
+  fn blood_bonus_handles_zero_values() {
+    assert_eq!(blood_bonus(100, 0), 0);
+    assert_eq!(blood_bonus(0, 100), 0);
+    assert_eq!(blood_bonus(0, 0), 0);
+  }
+
+  #[test]
+  fn blood_bonus_truncates_like_the_legacy_formula() {
+    assert_eq!(blood_bonus(101, 33), 33);
+    assert_eq!(blood_bonus(199, 33), 65);
+  }
+}

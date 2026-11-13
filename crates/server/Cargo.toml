@@ -1,0 +1,81 @@
+[package]
+description = "Server for Ret2Shell - A feature-riches CTF challenge platform."
+name        = "r2s-server"
+
+authors      = { workspace = true }
+edition      = { workspace = true }
+homepage     = { workspace = true }
+publish      = { workspace = true }
+repository   = { workspace = true }
+rust-version = { workspace = true }
+version      = { workspace = true }
+
+[dependencies]
+anyhow         = { workspace = true }
+argon2         = { workspace = true }
+async-nats     = { workspace = true }
+axum           = { workspace = true }
+axum-extra     = { workspace = true }
+base64         = { workspace = true }
+bcrypt         = { workspace = true }
+chrono         = { workspace = true }
+clap           = { workspace = true }
+deunicode      = { workspace = true }
+flate2         = { workspace = true }
+futures        = { workspace = true }
+heck           = { workspace = true }
+hyper-util     = { workspace = true }
+jsonwebtoken   = { workspace = true }
+nanoid         = { workspace = true }
+once_cell      = { workspace = true }
+owo-colors     = { workspace = true }
+rand           = { workspace = true }
+regex          = { workspace = true }
+rustls         = { workspace = true }
+sea-orm        = { workspace = true }
+serde          = { workspace = true }
+serde_json     = { workspace = true }
+tar            = { workspace = true }
+thiserror      = { workspace = true }
+tokio          = { workspace = true }
+tokio-stream   = { workspace = true }
+tokio-util     = { workspace = true }
+tower          = { workspace = true }
+tower-http     = { workspace = true }
+tower_governor = { workspace = true }
+urlencoding    = { workspace = true }
+validator      = { workspace = true }
+
+# Logger
+tracing            = { workspace = true }
+tracing-appender   = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# local crates
+r2s-auditor  = { workspace = true }
+r2s-bucket   = { workspace = true }
+r2s-cache    = { workspace = true }
+r2s-captcha  = { workspace = true }
+r2s-checker  = { workspace = true }
+r2s-cluster  = { workspace = true }
+r2s-config   = { workspace = true }
+r2s-database = { workspace = true }
+r2s-email    = { workspace = true }
+r2s-engine   = { workspace = true }
+r2s-event    = { workspace = true }
+r2s-media    = { workspace = true }
+r2s-migrator = { workspace = true }
+r2s-oauth    = { workspace = true }
+r2s-queue    = { workspace = true }
+
+[build-dependencies]
+build-target  = { workspace = true }
+git-version   = { workspace = true }
+rustc_version = { workspace = true }
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "r2s-server"
+path = "src/main.rs"
